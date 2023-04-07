@@ -1,0 +1,526 @@
+#encoding:gbk
+#code ver 1.46
+
+import time
+import re
+import sys
+import os
+import random
+import requests
+from urllib.parse import quote, unquote
+
+def init(g):
+	g.acc_id = '55419513'
+	g.init_fund = 410280
+	g.yfuser = 'Mars'
+	g.yftoken = '263BF03C15F49770F6B04E2E'
+	g.yfclid = 'c568551'
+	g.yfurl = 'http://www.ycyflh.com/api'
+	g.delays_trade = 0
+	g.worktime = '14:50:00-14:58:00'
+	g.commission = float(1.0)
+	g.price_lv_n = 1
+	g.lst_skip = ['国债指数', '银华日利']
+	g.lst_etf = {
+		"上证50" : "510050.SH",
+		"全指信息" : "159939.SZ",
+		"中证传媒" : "512980.SH",
+		"中证1000" : "159845.SZ",
+		"深证红利" : "159905.SZ",
+		"基本面50" : "512750.SH",
+		"生物医药" : "159859.SZ",
+		"中证环保" : "512580.SH",
+		"消费80" : "510150.SH",
+		"细分医药" : "512120.SH",
+		"300非银" : "512070.SH",
+		"中证可选" : "515300.SH",
+		"基建工程" : "516970.SH",
+		"CS新能车" : "515030.SH",
+		"细分食品" : "515170.SH",
+		"细分机械" : "159886.SZ",
+		"物联网50" : "159709.SZ",
+		"国证食品" : "159843.SZ",
+		"300成长" : "562310.SH"
+	}
+	mc = re.match('^(\d{2}):(\d{2}):(\d{2})-(\d{2}):(\d{2}):(\d{2})$', g.worktime)
+	if mc:
+		g.worktime_s = int(mc.group(1) + mc.group(2) + mc.group(3))
+		g.worktime_e = int(mc.group(4) + mc.group(5) + mc.group(6))
+		print('本策略将在%s:%s:%s开始计算和交易 (%s:%s:%s之前启动有效)'
+			% (mc.group(1), mc.group(2), mc.group(3), mc.group(4), mc.group(5), mc.group(6)))
+		lst_acct = get_trade_detail_data(g.acc_id, 'stock', 'account')
+		if len(lst_acct) == 1:
+			save_his_state(g.yfclid, 'workstate', '0')
+		else:
+			print('证券账号 %s 无效，本策略无法启动！' % g.acc_id)
+			save_his_state(g.yfclid, 'workstate', '2')
+			return
+	else:
+		print('配置错误：g.worktime=', g.worktime)
+		save_his_state(g.yfclid, 'workstate', '2')
+		return
+	save_his_state(g.yfclid, 'tick_last', str(time.time()))
+	request_data(g)
+
+def handlebar(g):
+	tick_cur = time.time()
+	tick_last = float(get_his_state(g.yfclid, 'tick_last', '^\d+(\.\d+)*$', '0'))
+	if tick_cur - tick_last < 5:
+		return
+	save_his_state(g.yfclid, 'tick_last', str(tick_cur))
+	workstate = int(get_his_state(g.yfclid, 'workstate', '^[012]$', '0'))
+	if workstate != 0 and workstate != 1:
+		print('workstate=%s, 策略已异常退出, 请人工接管！' % workstate)
+		return
+	hhmmss = int(timetag_to_datetime(tick_cur * 1000, '%H%M%S'))
+	if hhmmss < g.worktime_s or hhmmss > g.worktime_e:
+		return
+	if hhmmss < 93000:
+		if workstate == 1:
+			print('尚未开盘, 交易操作开盘后操作…')
+		return
+	if hhmmss > 145800:
+		if workstate == 1:
+			print('已收盘，交易未能完成，请人工接管！')
+		return
+	if hhmmss > 113000 and hhmmss < 130000:
+		if workstate == 1:
+			print('中午休市, 交易操作开盘后继续…')
+		return
+	if workstate == 0:
+		if request_data(g) == False:
+			return
+		if g.plan_time_last == g.plan_time:
+			print('策略运行正常 无需调仓')
+			return
+		save_his_state(g.yfclid, 'workstate', '1')
+		print('【开始调仓】[%s] %s' % (g.plan_time, g.plan_text))
+		dict_orders = dict()
+		plan_arr = g.plan_text.split(';')
+		for plan in plan_arr:
+			if len(plan) < 2:
+				continue
+			if plan.find('继续') != -1:
+				print('跳过 [%s]' % plan)
+				continue
+			index_name = ''
+			desc_vol = float(-1)
+			mc = re.match(' *([买入卖出]+) ([A-Z0-9\u4e00-\u9fa5]+ ?[A-Z0-9\u4e00-\u9fa5]*)', plan)
+			if mc:
+				index_name = mc.group(2)
+				if mc.group(1) == '买入':
+					desc_vol = float(1)
+				elif mc.group(1) == '卖出':
+					desc_vol = float(0)
+			else:
+				mc = re.match(' *([A-Z0-9\u4e00-\u9fa5]+ ?[A-Z0-9\u4e00-\u9fa5]*) 仓位\d+\.?\d*%→(\d+\.?\d*)%', plan)
+				if mc:
+					index_name = mc.group(1)
+					desc_vol = float(mc.group(2)) / 100
+			if index_name == '' or desc_vol < 0 or desc_vol > 1:
+				print('无法识别的操作 [%s]，请人工接管！' % plan)
+				save_his_state(g.yfclid, 'workstate', '2')
+				return
+			if index_name in g.lst_skip:
+				print('跳过 %s' % index_name)
+				continue
+			if index_name not in g.lst_etf:
+				print('无法处理的品种 %s，请人工接管！' % index_name)
+				save_his_state(g.yfclid, 'workstate', '2')
+				return
+			op_etf = g.lst_etf[index_name]
+			if op_etf in dict_orders:
+				dict_orders[op_etf].vol_per_desc = dict_orders[op_etf].vol_per_desc + desc_vol
+			else:
+				dict_orders[op_etf] = OrderItem()
+				dict_orders[op_etf].vol_per_desc = desc_vol
+			print('%s %s 目标仓位 %f' %(mc.group(1), op_etf, dict_orders[op_etf].vol_per_desc))
+		print('【缓存的历史仓位数据 - 调仓前】')
+		print(g.my_data)
+		print('===' * 10)
+		trade_init(dict_orders, g)
+		print('【执行调仓】')
+		if g.delays_trade > 0:
+			tick_tmp = time.time() + g.delays_trade - 4
+			hhmmss_tmp = int(timetag_to_datetime(tick_tmp * 1000, "%H%M%S"))
+			if hhmmss_tmp > 145500:
+				hh_tmp = hhmmss_tmp // 10000
+				mm_tmp = (hhmmss_tmp - hh_tmp * 10000) // 100
+				ss_tmp = hhmmss_tmp % 100
+				tick_tmp = tick_tmp - ((hh_tmp * 60 * 60 + mm_tmp * 60 + ss_tmp) - (14 * 60 * 60 + 55 * 60))
+				print('延迟%s秒已超过14:55，修正为14:55交易' % g.delays_trade)
+			else:
+				print('延迟%s秒交易' % g.delays_trade)
+			save_his_state(g.yfclid, 'tick_last', str(tick_tmp))
+			save_trader_state(g)
+			return
+		trade_run(g)
+		save_trader_state(g)
+		return
+	elif workstate == 1:
+		print('交易中…')
+		load_trader_state(g)
+		trade_run(g)
+		save_trader_state(g)
+		return
+
+def trade_init(dict_orders, g):
+	my_data_arr = g.my_data.split('\r\n')
+	available = float(my_data_arr[1])
+	print('策略可用资金:', available)
+	if len(dict_orders) > 0:
+		acct_info = get_trade_detail_data(g.acc_id, 'stock', 'account')[0]
+		available2 =  acct_info.m_dAvailable
+		print('账户实际可用资金:', available2)
+		if available2 < available:
+			available = available2
+	if len(my_data_arr) > 2:
+		for i in range(2, len(my_data_arr)):
+			mc = re.match('(\d{6}\.[A-Z]{2})\t(\d+)', my_data_arr[i])
+			if mc:
+				etf = mc.group(1)
+				vol = int(mc.group(2))
+				if etf not in dict_orders:
+					dict_orders[etf] = OrderItem()
+					dict_orders[etf].trade = False
+				dict_orders[etf].vol_hold = vol
+				#dict_orders[etf].price = round(g.get_market_data(['close'], stock_code=[etf], skip_paused=True, period='1d'), 3)
+				dict_orders[etf].price = round(g.get_full_tick([etf])[etf]['lastPrice'], 3)
+	market_value_sum = 0.0
+	for k in dict_orders:
+		item = dict_orders[k]
+		item.market_value = round(item.vol_hold * item.price, 3)
+		market_value_sum = market_value_sum + item.market_value
+	market_value_sum = round(market_value_sum, 3)
+	print('策略持仓市值:', market_value_sum)
+	balance = available + market_value_sum
+	print('策略总资产:', balance)
+	if balance <= 0:
+		print('【策略总资产为0】请清空缓存并重新配置策略！！！')
+		for k in dict_orders:
+			dict_orders[k].trade = False
+	else:
+		print('【调仓任务】')
+		for k in dict_orders:
+			item = dict_orders[k]
+			if item.trade == False:
+				continue
+			item.vol_per_src = item.market_value / balance
+			if item.vol_per_desc > item.vol_per_src:
+				item.isbuy = True
+				item.amount_need_buy = round((item.vol_per_desc - item.vol_per_src) * balance, 3)
+				item.amount_bought = float(0.0)
+				print('%s 原仓位%s 原持有%s股 目标仓位%s 本次买入%s元' 
+					% (k, item.vol_per_src, item.vol_hold, item.vol_per_desc, item.amount_need_buy))
+			elif item.vol_per_desc < item.vol_per_src:
+				item.isbuy = False
+				if item.vol_per_desc <= 0:
+					item.vol_hold_after_sell = 0
+				else:
+					item.vol_hold_after_sell = int((balance * item.vol_per_desc) / item.price / 100) * 100
+				print('%s 原仓位%s 原持有%s股 目标仓位%s 本次卖出%s股' 
+					% (k, item.vol_per_src, item.vol_hold, item.vol_per_desc, item.vol_hold - item.vol_hold_after_sell))
+			else:
+				item.trade = False
+	g.trade_order_timeout = random.randint(30, 60)
+	g.trade_available = available
+	g.trade_dict_orders = dict_orders
+
+def trade_run(g):
+	all_completed = True
+	for k in g.trade_dict_orders:
+		item = g.trade_dict_orders[k]
+		if item.trade == False:
+			continue
+		if item.completed == True:
+			continue
+		all_completed = False
+		if item.order_id == '-1':
+			df = g.get_instrumentdetail(k)
+			upStopPrice = df['UpStopPrice']
+			downStopPrice = df['DownStopPrice']
+			price_curr_use = float()
+			if g.price_lv_n >= 1 and g.price_lv_n <= 5:
+				df = g.get_full_tick([k])[k]
+				price_lv_arr = df['askPrice'] if item.isbuy else df['bidPrice']
+				for idx in range(g.price_lv_n, 0, -1):
+					price_var = round(price_lv_arr[idx - 1], 3)
+					if price_var > 0:
+						price_curr_use = price_var
+						break
+			if price_curr_use == 0.0:
+				price_curr_use = upStopPrice if item.isbuy else downStopPrice
+			list_order_ids = list()
+			order_list = get_trade_detail_data(g.acc_id, 'stock', 'order', g.yfclid)
+			for order_obj in order_list:
+				list_order_ids.append(order_obj.m_strOrderSysID)
+			if item.isbuy:
+				item.completed = item.amount_bought / item.amount_need_buy > 0.98
+				if item.completed:
+					print('【成交完成a】买入 %s 本次需买入%s元 实际买入%s元' % (k, item.amount_need_buy, item.amount_bought))
+					continue
+				amount_need_var = item.amount_need_buy - item.amount_bought
+				amount_var = amount_need_var
+				comm_tmp = amount_var / 10000 * g.commission
+				item.vol_curr_order = int((amount_var - comm_tmp) / price_curr_use / 100) * 100
+				item.completed = item.vol_curr_order < 100
+				if item.completed:
+					print('【成交完成b】买入 %s 本次需买入%s元 实际买入%s元' % (k, item.amount_need_buy, item.amount_bought))
+					continue
+				item.vol_curr_order = 0
+				if g.trade_available < amount_var:
+					amount_var = g.trade_available
+				comm_tmp = amount_var / 10000 * g.commission
+				if amount_var - comm_tmp > price_curr_use * 100:
+					item.vol_curr_order = int((amount_var - comm_tmp) / price_curr_use / 100) * 100
+					if item.vol_curr_order > 1000000:
+						item.vol_curr_order = 1000000
+				if item.vol_curr_order < 1000000:
+					if item.vol_curr_order < 100 or (amount_var < amount_need_var * 0.5):
+						print('【买入%s资金不足, 等待其他卖单成交后继续】需买入:%s 已买入:%s 还需买入:%s 可用:%s' 
+							% (k, item.amount_need_buy, item.amount_bought, amount_need_var, g.trade_available))
+						continue
+				print('【%d 挂买单 %s】%s * %s' % (item.order_number, k, price_curr_use, item.vol_curr_order))
+				passorder(23, 1101, g.acc_id, k, 11, price_curr_use, item.vol_curr_order, g.yfclid, 2, '', g)
+				item.order_updown_stop = price_curr_use >= upStopPrice
+				item.order_number = item.order_number + 1
+			else:
+				item.vol_curr_order = item.vol_hold - item.vol_hold_after_sell
+				item.completed = item.vol_curr_order < 100
+				if item.completed:
+					print('【成交完成c】卖出 ', k)
+					continue
+				if item.vol_curr_order > 1000000:
+					item.vol_curr_order = 1000000
+				print('【%d 挂卖单 %s】%s * %s' % (item.order_number, k, price_curr_use, item.vol_curr_order))
+				passorder(24, 1101, g.acc_id, k, 11, price_curr_use, item.vol_curr_order, g.yfclid, 2, '', g)
+				item.order_updown_stop = price_curr_use <= downStopPrice
+				item.order_number = item.order_number + 1
+			item.order_time = time.time()
+			flag_ok = False
+			order_id_var = '-1'
+			for i in range(20):
+				time.sleep(0.5)
+				order_list = get_trade_detail_data(g.acc_id, 'stock', 'order', g.yfclid)
+				for order_obj in order_list:
+					order_id_var = order_obj.m_strOrderSysID
+					if order_id_var in list_order_ids:
+						continue
+					if re.match('^\d+$', order_id_var) == None:
+						continue
+					item.order_id = order_id_var
+					flag_ok = True
+					print('委托编号 ', item.order_id)
+					break
+				if flag_ok == True:
+					break
+				elif i == 19:
+					n = 1
+					for order_obj in order_list:
+						print('order_%d:%s [%s] %s' % (n, order_obj.m_strOrderSysID, order_obj.m_nOrderStatus, order_obj.m_strCancelInfo))
+						n = n + 1
+			if flag_ok == False:
+				print(list_order_ids)
+				print('获取委托编号失败！请立即人工接管！')
+				save_his_state(g.yfclid, 'workstate', '2')
+				return
+		else:
+			deal_vol = 0
+			deal_amount = float()
+			deal_list = get_trade_detail_data(g.acc_id, 'stock', 'deal', g.yfclid)
+			for deal_obj in deal_list:
+				if (deal_obj.m_strOrderSysID != item.order_id):
+					continue
+				deal_vol = deal_vol + deal_obj.m_nVolume
+				deal_amount = round(deal_amount + deal_obj.m_dTradeAmount, 3)
+			if deal_vol < item.vol_curr_order:
+				print('【部分成交 %s 股数 %s; 金额 %s; 委托ID %s】' % (k, deal_vol, deal_amount, item.order_id))
+				if item.order_updown_stop:
+					print('但因挂在涨跌停价上，不做撤单，继续等待成交…')
+					continue
+				elif time.time() - item.order_time < g.trade_order_timeout:
+					print('委托暂未超时，继续等待，暂不撤单…')
+					continue
+				else:
+					print('【撤单】委托ID: %s' % item.order_id)
+					cancel(item.order_id, g.acc_id, 'stock', g)
+					time.sleep(5)
+					deal_vol = 0
+					deal_amount = float()
+					deal_list = get_trade_detail_data(g.acc_id, 'stock', 'deal', g.yfclid)
+					for deal_obj in deal_list:
+						if (deal_obj.m_strOrderSysID != item.order_id):
+							continue
+						deal_vol = deal_vol + deal_obj.m_nVolume
+						deal_amount = round(deal_amount + deal_obj.m_dTradeAmount, 3)
+			comm_var = deal_amount / 10000 * g.commission
+			if item.isbuy:
+				print('【买入%s】委托%s股; 成交%s股; 成交额%s; 委托ID %s' % (k, item.vol_curr_order, deal_vol, deal_amount, item.order_id))
+				item.vol_hold = item.vol_hold + deal_vol
+				item.amount_bought = item.amount_bought + deal_amount + comm_var
+				g.trade_available = g.trade_available - deal_amount - comm_var
+			else:
+				print('【卖出%s】委托%s股; 成交%s股; 成交额%s; 委托ID %s' % (k, item.vol_curr_order, deal_vol, deal_amount, item.order_id))
+				item.vol_hold = item.vol_hold - deal_vol
+				g.trade_available = g.trade_available + deal_amount - comm_var
+			item.order_id = '-1'
+	if all_completed == False:
+		return
+	save_his_state(g.yfclid, 'workstate', '0')
+	print('== 调仓完成 ==')
+	if g.trade_available < 0:
+		print('行情波动至可用资金[%s]小于0，校正为0', g.trade_available)
+		g.trade_available = 0
+	g.my_data = g.plan_time + '\r\n' + str(round(g.trade_available, 3))
+	for k in g.trade_dict_orders:
+		item = g.trade_dict_orders[k]
+		if item.vol_hold > 0:
+			g.my_data = g.my_data + '\r\n' + k + '\t' + str(item.vol_hold)
+	print('【调仓后的仓位数据】')
+	print(g.my_data)
+	print('===' * 10)
+	if update_mydata(g.my_data, g):
+		print('仓位数据保存成功!')
+
+def request_data(g):
+	try:
+		url = '%s?user=%s&token=%s&m=1&id=%s' % (g.yfurl, g.yfuser, g.yftoken, g.yfclid)
+		request = requests.get(url)
+		request.encoding = "utf-8"
+		js = request.json()
+		if 'errcode' in js:
+			if js['errcode'] != 1006:
+				print(js)
+			return False
+		cl_name = js[0]['策略名']
+		plan_time = js[0]['调仓时间']
+		if re.match('^\d+-\d+-\d+ \d+:\d+$', plan_time) == None:
+			print('无法识别的调仓时间：', plan_time)
+			return False
+		plan_text = js[0]['调仓方案']
+		my_data = unquote(js[0]['自定义数据'], 'utf-8')
+		mc = re.match('^(\d+-\d+-\d+ \d+:\d+)\r\n\d+\.?\d*(\r\n\d{6}\.[A-Z]{2}\t\d+)*$', my_data)
+		plan_time_last_var = ''
+		if mc:
+			plan_time_last_var = mc.group(1)
+		else:
+			plan_time_last_var = plan_time
+			print('历史仓位数据[%s]为空或格式无效，判断为首次开启策略，自动初始化为[上次调仓时间:%s; 可用资金:%s]' % (my_data, plan_time, g.init_fund))
+			my_data = plan_time + '\r\n' + str(g.init_fund)
+			if update_mydata(my_data, g) == False:
+				return False
+		if hasattr(g, 'plan_time_last') == False:
+			print('启动 %s，上次已处理调仓时间: %s' % (cl_name, plan_time_last_var))
+			print('【缓存的历史仓位数据】')
+			print(my_data)
+			print('===' * 10)
+		g.plan_time_last = plan_time_last_var
+		g.plan_time = plan_time
+		g.plan_text = plan_text
+		g.my_data = my_data
+		return True
+	except:
+		print("requestdata ERROR:", sys.exc_info())
+		return False
+
+def update_mydata(my_data, g):
+	my_data_quote = quote(my_data, 'utf-8')
+	url = '%s?user=%s&token=%s&m=2&id=%s&data=%s' % (g.yfurl, g.yfuser, g.yftoken, g.yfclid, my_data_quote)
+	js = ''
+	for i in range(10):
+		try:
+			request = requests.get(url)
+			request.encoding = "utf-8"
+			js = request.json()
+			if 'errcode' in js and js['errcode'] == 0:
+				return True
+		except:
+			pass
+		time.sleep(1)
+	print(js)
+	print(url)
+	print('仓位数据保存失败！')
+	return False
+
+def get_his_state(yfclid, k, pattern, dft):
+	filename = "%s\\_myfiles\\%s_%s.txt" % (os.getcwd(), yfclid, k)
+	if os.path.exists(filename):
+		fs = open(filename, 'r')
+		txtbfr = fs.readline()
+		fs.close()
+		mc = re.match(pattern, txtbfr)
+		if mc:
+			return txtbfr
+	return dft
+
+def save_his_state(yfclid, k, vlu):
+	filename = "%s\\_myfiles" % os.getcwd()
+	if not os.path.exists(filename):
+		os.mkdir(filename)
+	filename = "%s\\%s_%s.txt" % (filename, yfclid, k)
+	with open(filename, 'w') as fs:
+		fs.write(vlu)
+
+def load_trader_state(g):
+	g.plan_time = get_his_state(g.yfclid, 'plan_time', '^.*$', '')
+	g.trade_order_timeout = int(get_his_state(g.yfclid, 'trade_order_timeout', '^\d{2}$', '60'))
+	g.trade_available = float(get_his_state(g.yfclid, 'trade_available', '^[\d\.\-]*$', '0'))
+	dict_orders = dict()
+	strtmp = get_his_state(g.yfclid, 'trade_dict_orders', '^.*$', '')
+	arr0 = strtmp.split('$')
+	for line in arr0:
+		arr1 = line.split(';')
+		if len(arr1) == 2:
+			dict_orders[arr1[0]] = OrderItem().FromString(arr1[1])
+	g.trade_dict_orders = dict_orders
+
+def save_trader_state(g):
+	save_his_state(g.yfclid, 'plan_time', g.plan_time)
+	save_his_state(g.yfclid, 'trade_order_timeout', str(g.trade_order_timeout))
+	save_his_state(g.yfclid, 'trade_available', str(g.trade_available))
+	strtmp = ''
+	for k in g.trade_dict_orders:
+		if strtmp != '':
+			strtmp = strtmp + '$'
+		strtmp = strtmp + k + ';' + g.trade_dict_orders[k].ToString()
+	save_his_state(g.yfclid, 'trade_dict_orders', strtmp)
+
+class OrderItem:
+	trade = True
+	vol_hold = 0
+	price = float()
+	market_value = float()
+	vol_per_src = float()
+	vol_per_desc = float()
+	isbuy = False
+	amount_need_buy = float()
+	amount_bought = float()
+	vol_hold_after_sell = 0
+	vol_curr_order = 0
+	order_number = 1
+	order_id = '-1'
+	order_time = float()
+	order_updown_stop = False
+	completed = False
+	def ToString(self):
+		str = '{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}'
+		return str.format(int(self.trade),self.vol_hold,self.price,self.market_value,self.vol_per_src,self.vol_per_desc,int(self.isbuy),self.amount_need_buy,self.amount_bought,self.vol_hold_after_sell,self.vol_curr_order,self.order_number,self.order_id,self.order_time,int(self.order_updown_stop),int(self.completed))
+	def FromString(self, str):
+		arr = str.split('|')
+		self.trade = bool(int(arr[0]))
+		self.vol_hold = int(arr[1])
+		self.price = float(arr[2])
+		self.market_value = float(arr[3])
+		self.vol_per_src = float(arr[4])
+		self.vol_per_desc = float(arr[5])
+		self.isbuy = bool(int(arr[6]))
+		self.amount_need_buy = float(arr[7])
+		self.amount_bought = float(arr[8])
+		self.vol_hold_after_sell = int(arr[9])
+		self.vol_curr_order = int(arr[10])
+		self.order_number = int(arr[11])
+		self.order_id = arr[12]
+		self.order_time = float(arr[13])
+		self.order_updown_stop = bool(int(arr[14]))
+		self.completed = bool(int(arr[15]))
+		return self
